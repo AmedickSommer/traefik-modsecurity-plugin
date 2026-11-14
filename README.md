@@ -66,7 +66,7 @@ paths fail.
 ```yaml
 command:
   - "--experimental.plugins.traefik-modsecurity-plugin.modulename=github.com/AmedickSommer/traefik-modsecurity-plugin"
-  - "--experimental.plugins.traefik-modsecurity-plugin.version=v1.0.0"
+  - "--experimental.plugins.traefik-modsecurity-plugin.version=v1.1.0"
 ```
 
 ```yaml

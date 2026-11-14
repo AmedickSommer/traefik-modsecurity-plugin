@@ -64,22 +64,24 @@ func TestModsecurity_ServeHTTP(t *testing.T) {
 			jailEnabled:     false,
 		},
 		{
-			name: "Does not forward Websockets",
+			name: "Intercepts websocket handshakes when WAF found threats",
 			request: &http.Request{
 				Body: http.NoBody,
 				Header: http.Header{
-					"Upgrade": []string{"websocket"},
+					"Connection": []string{"Upgrade"},
+					"Upgrade":    []string{"websocket"},
 				},
-				Method: http.MethodGet,
-				URL:    req.URL,
+				Method:     http.MethodGet,
+				URL:        req.URL,
+				RequestURI: "/test",
 			},
 			wafResponse: response{
-				StatusCode: 200,
+				StatusCode: 403,
 				Body:       "Response from waf",
 			},
 			serviceResponse: serviceResponse,
-			expectBody:      "Response from service",
-			expectStatus:    200,
+			expectBody:      "Response from waf",
+			expectStatus:    403,
 			jailEnabled:     false,
 		},
 		{

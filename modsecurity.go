@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
 )
@@ -19,10 +20,11 @@ import (
 type Config struct {
 	TimeoutMillis                  int64  `json:"timeoutMillis,omitempty"`
 	ModSecurityUrl                 string `json:"modSecurityUrl,omitempty"`
+	MaxBodySize                    int64  `json:"maxBodySize,omitempty"`
 	JailEnabled                    bool   `json:"jailEnabled,omitempty"`
 	BadRequestsThresholdCount      int    `json:"badRequestsThresholdCount,omitempty"`
-	BadRequestsThresholdPeriodSecs int    `json:"badRequestsThresholdPeriodSecs,omitempty"` // Period in seconds to track attempts
-	JailTimeDurationSecs           int    `json:"jailTimeDurationSecs,omitempty"`                     // How long a client spends in Jail in seconds
+	BadRequestsThresholdPeriodSecs int    `json:"badRequestsThresholdPeriodSecs,omitempty"`
+	JailTimeDurationSecs           int    `json:"jailTimeDurationSecs,omitempty"`
 }
 
 // CreateConfig creates the default plugin configuration.
@@ -36,10 +38,24 @@ func CreateConfig() *Config {
 	}
 }
 
+// hopHeaders apply to a single connection and must not reach the WAF.
+var hopHeaders = []string{
+	"Connection",
+	"Keep-Alive",
+	"Proxy-Authenticate",
+	"Proxy-Authorization",
+	"Proxy-Connection",
+	"Te",
+	"Trailer",
+	"Transfer-Encoding",
+	"Upgrade",
+}
+
 // Modsecurity a Modsecurity plugin.
 type Modsecurity struct {
 	next                           http.Handler
 	modSecurityUrl                 string
+	maxBodySize                    int64
 	name                           string
 	httpClient                     *http.Client
 	logger                         *log.Logger
@@ -49,31 +65,28 @@ type Modsecurity struct {
 	jailTimeDurationSecs           int
 	jail                           map[string][]time.Time
 	jailRelease                    map[string]time.Time
-	jailMutex                      sync.RWMutex
+	jailMutex                      sync.Mutex
 }
 
 // New creates a new Modsecurity plugin with the given configuration.
-// It returns an HTTP handler that can be integrated into the Traefik middleware chain.
 func New(ctx context.Context, next http.Handler, config *Config, name string) (http.Handler, error) {
 	if len(config.ModSecurityUrl) == 0 {
 		return nil, fmt.Errorf("modSecurityUrl cannot be empty")
 	}
+	if config.MaxBodySize < 0 {
+		return nil, fmt.Errorf("maxBodySize cannot be negative")
+	}
 
-	// Use a custom client with predefined timeout of 2 seconds
-	var timeout time.Duration
-	if config.TimeoutMillis == 0 {
-		timeout = 2 * time.Second
-	} else {
+	timeout := 2 * time.Second
+	if config.TimeoutMillis != 0 {
 		timeout = time.Duration(config.TimeoutMillis) * time.Millisecond
 	}
 
-	// dialer is a custom net.Dialer with a specified timeout and keep-alive duration.
 	dialer := &net.Dialer{
 		Timeout:   30 * time.Second,
 		KeepAlive: 30 * time.Second,
 	}
 
-	// transport is a custom http.Transport with various timeouts and configurations for optimal performance.
 	transport := &http.Transport{
 		MaxIdleConns:          100,
 		IdleConnTimeout:       90 * time.Second,
@@ -90,6 +103,7 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 
 	return &Modsecurity{
 		modSecurityUrl:                 config.ModSecurityUrl,
+		maxBodySize:                    config.MaxBodySize,
 		next:                           next,
 		name:                           name,
 		httpClient:                     &http.Client{Timeout: timeout, Transport: transport},
@@ -104,49 +118,39 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 }
 
 func (a *Modsecurity) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
-	if isWebsocket(req) {
-		a.next.ServeHTTP(rw, req)
+	clientIP := remoteIP(req)
+
+	if a.jailEnabled && a.isClientInJail(clientIP) {
+		a.logger.Printf("client %s is jailed", clientIP)
+		http.Error(rw, "Too Many Requests", http.StatusTooManyRequests)
 		return
 	}
 
-	clientIP := req.RemoteAddr
-
-	// Check if the client is in jail, if jail is enabled
-	if a.jailEnabled {
-		a.jailMutex.RLock()
-		if a.isClientInJail(clientIP) {
-			a.jailMutex.RUnlock()
-			a.logger.Printf("client %s is jailed", clientIP)
-			http.Error(rw, "Too Many Requests", http.StatusTooManyRequests)
-			return
-		}
-		a.jailMutex.RUnlock()
+	if a.maxBodySize > 0 && req.ContentLength > a.maxBodySize {
+		http.Error(rw, "Request Entity Too Large", http.StatusRequestEntityTooLarge)
+		return
 	}
 
-	// Buffer the body if we want to read it here and send it in the request.
-	body, err := io.ReadAll(req.Body)
+	body, err := a.readBody(req)
 	if err != nil {
 		a.logger.Printf("fail to read incoming request: %s", err.Error())
 		http.Error(rw, "", http.StatusBadGateway)
 		return
 	}
+	if a.maxBodySize > 0 && int64(len(body)) > a.maxBodySize {
+		http.Error(rw, "Request Entity Too Large", http.StatusRequestEntityTooLarge)
+		return
+	}
 	req.Body = io.NopCloser(bytes.NewReader(body))
 
-	// Create a new URL from the raw RequestURI sent by the client
-	url := fmt.Sprintf("%s%s", a.modSecurityUrl, req.RequestURI)
-
-	proxyReq, err := http.NewRequest(req.Method, url, bytes.NewReader(body))
+	proxyReq, err := http.NewRequestWithContext(req.Context(), req.Method, a.modSecurityUrl+requestURI(req), bytes.NewReader(body))
 	if err != nil {
 		a.logger.Printf("fail to prepare forwarded request: %s", err.Error())
 		http.Error(rw, "", http.StatusBadGateway)
 		return
 	}
-
-	// We may want to filter some headers, otherwise we could just use a shallow copy
-	proxyReq.Header = make(http.Header)
-	for h, val := range req.Header {
-		proxyReq.Header[h] = val
-	}
+	proxyReq.Header = wafHeaders(req, clientIP)
+	proxyReq.Host = req.Host
 
 	resp, err := a.httpClient.Do(proxyReq)
 	if err != nil {
@@ -163,30 +167,80 @@ func (a *Modsecurity) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		forwardResponse(resp, rw)
 		return
 	}
+	_, _ = io.Copy(io.Discard, resp.Body)
 
 	a.next.ServeHTTP(rw, req)
 }
 
-func isWebsocket(req *http.Request) bool {
-	for _, header := range req.Header["Upgrade"] {
-		if header == "websocket" {
-			return true
+func (a *Modsecurity) readBody(req *http.Request) ([]byte, error) {
+	if req.Body == nil {
+		return nil, nil
+	}
+	if a.maxBodySize <= 0 {
+		return io.ReadAll(req.Body)
+	}
+	return io.ReadAll(io.LimitReader(req.Body, a.maxBodySize+1))
+}
+
+// wafHeaders copies the request headers for the WAF, without hop-by-hop headers,
+// so that every request, including a websocket handshake, is inspected as plain HTTP.
+func wafHeaders(req *http.Request, clientIP string) http.Header {
+	header := req.Header.Clone()
+	if header == nil {
+		header = make(http.Header)
+	}
+	for _, field := range header.Values("Connection") {
+		for _, name := range strings.Split(field, ",") {
+			if name = strings.TrimSpace(name); name != "" {
+				header.Del(name)
+			}
 		}
 	}
-	return false
+	for _, name := range hopHeaders {
+		header.Del(name)
+	}
+
+	if header.Get("X-Forwarded-For") == "" && clientIP != "" {
+		header.Set("X-Forwarded-For", clientIP)
+	}
+	if header.Get("X-Forwarded-Host") == "" && req.Host != "" {
+		header.Set("X-Forwarded-Host", req.Host)
+	}
+	if header.Get("X-Forwarded-Proto") == "" {
+		proto := "http"
+		if req.TLS != nil {
+			proto = "https"
+		}
+		header.Set("X-Forwarded-Proto", proto)
+	}
+	return header
+}
+
+// requestURI keeps the client's raw encoding, but turns an absolute-form
+// target ("GET http://host/path") into a path the WAF URL can be joined with.
+func requestURI(req *http.Request) string {
+	if strings.HasPrefix(req.RequestURI, "/") {
+		return req.RequestURI
+	}
+	return req.URL.RequestURI()
+}
+
+func remoteIP(req *http.Request) string {
+	host, _, err := net.SplitHostPort(req.RemoteAddr)
+	if err != nil {
+		return req.RemoteAddr
+	}
+	return host
 }
 
 func forwardResponse(resp *http.Response, rw http.ResponseWriter) {
-	// Copy headers
 	for k, vv := range resp.Header {
 		for _, v := range vv {
 			rw.Header().Add(k, v)
 		}
 	}
-	// Copy status
 	rw.WriteHeader(resp.StatusCode)
-	// Copy body
-	io.Copy(rw, resp.Body)
+	_, _ = io.Copy(rw, resp.Body)
 }
 
 func (a *Modsecurity) recordOffense(clientIP string) {
@@ -194,42 +248,37 @@ func (a *Modsecurity) recordOffense(clientIP string) {
 	defer a.jailMutex.Unlock()
 
 	now := time.Now()
-	// Remove offenses that are older than the threshold period
-	if offenses, exists := a.jail[clientIP]; exists {
-		var newOffenses []time.Time
-		for _, offense := range offenses {
-			if now.Sub(offense) <= time.Duration(a.badRequestsThresholdPeriodSecs)*time.Second {
-				newOffenses = append(newOffenses, offense)
-			}
+	period := time.Duration(a.badRequestsThresholdPeriodSecs) * time.Second
+
+	var offenses []time.Time
+	for _, offense := range a.jail[clientIP] {
+		if now.Sub(offense) <= period {
+			offenses = append(offenses, offense)
 		}
-		a.jail[clientIP] = newOffenses
 	}
+	offenses = append(offenses, now)
+	a.jail[clientIP] = offenses
 
-	// Record the new offense
-	a.jail[clientIP] = append(a.jail[clientIP], now)
-
-	// Check if the client should be jailed
-	if len(a.jail[clientIP]) >= a.badRequestsThresholdCount {
+	if len(offenses) >= a.badRequestsThresholdCount {
 		a.logger.Printf("client %s reached threshold, putting in jail", clientIP)
 		a.jailRelease[clientIP] = now.Add(time.Duration(a.jailTimeDurationSecs) * time.Second)
 	}
 }
 
 func (a *Modsecurity) isClientInJail(clientIP string) bool {
-	if releaseTime, exists := a.jailRelease[clientIP]; exists {
-		if time.Now().Before(releaseTime) {
-			return true
-		}
-		a.releaseFromJail(clientIP)
-	}
-	return false
-}
-
-func (a *Modsecurity) releaseFromJail(clientIP string) {
 	a.jailMutex.Lock()
 	defer a.jailMutex.Unlock()
+
+	releaseTime, exists := a.jailRelease[clientIP]
+	if !exists {
+		return false
+	}
+	if time.Now().Before(releaseTime) {
+		return true
+	}
 
 	delete(a.jail, clientIP)
 	delete(a.jailRelease, clientIP)
 	a.logger.Printf("client %s released from jail", clientIP)
+	return false
 }

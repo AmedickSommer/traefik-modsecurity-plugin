@@ -291,3 +291,62 @@ func TestStatusHeaderIsNotSetWhenDisabled(t *testing.T) {
 
 	assert.Equal(t, "client-value", req.Header.Get("X-Waf-Status"))
 }
+
+func TestBodyAboveMaxInspectedSizeIsStreamedWithoutInspection(t *testing.T) {
+	for name, contentLength := range map[string]int64{"known length": 20, "chunked": -1} {
+		t.Run(name, func(t *testing.T) {
+			var wafBody string
+			config := CreateConfig()
+			config.MaxInspectedBodySize = 10
+			config.MaxBodySize = 100
+			handler, calls := newTestMiddleware(t, http.StatusOK, config, func(r *http.Request) {
+				b, _ := io.ReadAll(r.Body)
+				wafBody = string(b)
+			})
+
+			body := strings.Repeat("b", 20)
+			req := httptest.NewRequest(http.MethodPost, "http://example.com/upload", strings.NewReader(body))
+			req.ContentLength = contentLength
+			rw := httptest.NewRecorder()
+			handler.ServeHTTP(rw, req)
+
+			assert.Equal(t, int32(1), atomic.LoadInt32(calls))
+			assert.Empty(t, wafBody)
+			assert.Equal(t, body, rw.Body.String())
+		})
+	}
+}
+
+func TestBodyWithinMaxInspectedSizeIsInspected(t *testing.T) {
+	var wafBody string
+	config := CreateConfig()
+	config.MaxInspectedBodySize = 10
+	handler, _ := newTestMiddleware(t, http.StatusOK, config, func(r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		wafBody = string(b)
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "http://example.com/form", strings.NewReader("small"))
+	handler.ServeHTTP(httptest.NewRecorder(), req)
+	assert.Equal(t, "small", wafBody)
+}
+
+func TestStreamedBodyStopsAtMaxBodySize(t *testing.T) {
+	config := CreateConfig()
+	config.MaxInspectedBodySize = 10
+	config.MaxBodySize = 30
+	var readErr error
+	waf := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	t.Cleanup(waf.Close)
+	config.ModSecurityUrl = waf.URL
+	handler, err := New(context.Background(), http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, readErr = io.ReadAll(r.Body)
+	}), config, "test")
+	require.NoError(t, err)
+
+	req := httptest.NewRequest(http.MethodPost, "http://example.com/upload", strings.NewReader(strings.Repeat("c", 50)))
+	req.ContentLength = -1
+	handler.ServeHTTP(httptest.NewRecorder(), req)
+
+	assert.ErrorIs(t, readErr, errBodyTooLarge)
+}

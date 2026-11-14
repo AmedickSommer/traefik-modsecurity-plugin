@@ -40,6 +40,7 @@ the request when Traefik has not set them.
 | `modSecurityUrl`                 | –       | URL of the WAF container (required)                 |
 | `timeoutMillis`                  | `2000`  | Timeout for the call to the WAF                     |
 | `maxBodySize`                    | `0`     | Larger request bodies get `413`; `0` is unlimited   |
+| `maxInspectedBodySize`           | `0`     | Larger bodies skip WAF inspection; `0` is unlimited |
 | `statusHeader`                   | –       | Request header that receives the WAF outcome        |
 | `jailEnabled`                    | `false` | Answer `429` to clients with repeated WAF blocks    |
 | `badRequestsThresholdCount`      | `25`    | Number of `403`s that put a client in jail          |
@@ -49,8 +50,13 @@ the request when Traefik has not set them.
 Request bodies are held in memory while the WAF checks them, so set
 `maxBodySize` on public routers.
 
-With `statusHeader` set, the plugin writes `ok`, `blocked` or `error` into
-that request header and removes any value the client sent. Traefik's access
+A body larger than `maxInspectedBodySize` is not held in memory: the WAF
+checks method, URL and headers only, and the body is streamed to the service.
+A streamed body that grows beyond `maxBodySize` is cut off with an error,
+since the `413` can only be sent before streaming starts.
+
+With `statusHeader` set, the plugin writes `ok`, `blocked` or `error`
+into that request header and removes any value the client sent. Traefik's access
 log records it with:
 
 ```text

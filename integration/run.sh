@@ -35,6 +35,10 @@ check 'clean websocket handshake'            101 "${ws[@]}" "$base/echo"
 check 'body within maxBodySize'              200 --data-binary @<(head -c 1000 /dev/zero | tr '\0' a) "$base/"
 check 'body above maxBodySize'               413 --data-binary @<(head -c 2000000 /dev/zero | tr '\0' a) "$base/"
 
+check 'small body: attack is blocked'          403 --data 'f=../../../../etc/passwd' "$base/"
+check 'large body: not inspected, passes'      200 --data-binary @<(printf 'f=../../../../etc/passwd&p='; head -c 200000 /dev/zero | tr '\0' a) "$base/"
+check 'large body: attack in URL is blocked'   403 --data-binary @<(head -c 200000 /dev/zero | tr '\0' a) "$base$traversal"
+
 headers="$(curl -s -o /dev/null -D - --max-time 10 "$base$traversal")"
 if grep -qiE '^(server|access-control-[a-z-]+):' <<<"$headers"; then
   printf 'FAIL  %-45s %s\n' 'block page without WAF headers' "$(grep -iE '^(server|access-control)' <<<"$headers" | tr -d '\r' | paste -sd' ')"

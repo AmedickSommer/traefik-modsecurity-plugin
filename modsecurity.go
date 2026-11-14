@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -21,6 +22,7 @@ type Config struct {
 	TimeoutMillis                  int64  `json:"timeoutMillis,omitempty"`
 	ModSecurityUrl                 string `json:"modSecurityUrl,omitempty"`
 	MaxBodySize                    int64  `json:"maxBodySize,omitempty"`
+	MaxInspectedBodySize           int64  `json:"maxInspectedBodySize,omitempty"`
 	StatusHeader                   string `json:"statusHeader,omitempty"`
 	JailEnabled                    bool   `json:"jailEnabled,omitempty"`
 	BadRequestsThresholdCount      int    `json:"badRequestsThresholdCount,omitempty"`
@@ -64,6 +66,7 @@ type Modsecurity struct {
 	next                           http.Handler
 	modSecurityUrl                 string
 	maxBodySize                    int64
+	maxInspectedBodySize           int64
 	statusHeader                   string
 	name                           string
 	httpClient                     *http.Client
@@ -82,9 +85,10 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 	if len(config.ModSecurityUrl) == 0 {
 		return nil, fmt.Errorf("modSecurityUrl cannot be empty")
 	}
-	if config.MaxBodySize < 0 {
-		return nil, fmt.Errorf("maxBodySize cannot be negative")
+	if config.MaxBodySize < 0 || config.MaxInspectedBodySize < 0 {
+		return nil, fmt.Errorf("maxBodySize and maxInspectedBodySize cannot be negative")
 	}
+	logger := log.New(os.Stdout, "", log.LstdFlags)
 
 	timeout := 2 * time.Second
 	if config.TimeoutMillis != 0 {
@@ -113,11 +117,12 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 	return &Modsecurity{
 		modSecurityUrl:                 config.ModSecurityUrl,
 		maxBodySize:                    config.MaxBodySize,
+		maxInspectedBodySize:           config.MaxInspectedBodySize,
 		statusHeader:                   http.CanonicalHeaderKey(config.StatusHeader),
 		next:                           next,
 		name:                           name,
 		httpClient:                     &http.Client{Timeout: timeout, Transport: transport},
-		logger:                         log.New(os.Stdout, "", log.LstdFlags),
+		logger:                         logger,
 		jailEnabled:                    config.JailEnabled,
 		badRequestsThresholdCount:      config.BadRequestsThresholdCount,
 		badRequestsThresholdPeriodSecs: config.BadRequestsThresholdPeriodSecs,
@@ -146,21 +151,31 @@ func (a *Modsecurity) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	body, err := a.readBody(req)
-	if err != nil {
-		a.logger.Printf("fail to read incoming request: %s", err.Error())
-		a.setStatus(req, statusError)
-		http.Error(rw, "", http.StatusBadGateway)
-		return
+	inspectBody := a.maxInspectedBodySize <= 0 || req.ContentLength <= a.maxInspectedBodySize
+	var body []byte
+	if inspectBody {
+		var err error
+		body, inspectBody, err = a.readBody(req)
+		if err == errBodyTooLarge {
+			a.setStatus(req, statusBlocked)
+			http.Error(rw, "Request Entity Too Large", http.StatusRequestEntityTooLarge)
+			return
+		}
+		if err != nil {
+			a.logger.Printf("fail to read incoming request: %s", err.Error())
+			a.setStatus(req, statusError)
+			http.Error(rw, "", http.StatusBadGateway)
+			return
+		}
+	} else {
+		a.limitBody(req)
 	}
-	if a.maxBodySize > 0 && int64(len(body)) > a.maxBodySize {
-		a.setStatus(req, statusBlocked)
-		http.Error(rw, "Request Entity Too Large", http.StatusRequestEntityTooLarge)
-		return
-	}
-	req.Body = io.NopCloser(bytes.NewReader(body))
 
-	proxyReq, err := http.NewRequestWithContext(req.Context(), req.Method, a.modSecurityUrl+requestURI(req), bytes.NewReader(body))
+	var wafBody io.Reader
+	if inspectBody {
+		wafBody = bytes.NewReader(body)
+	}
+	proxyReq, err := http.NewRequestWithContext(req.Context(), req.Method, a.modSecurityUrl+requestURI(req), wafBody)
 	if err != nil {
 		a.logger.Printf("fail to prepare forwarded request: %s", err.Error())
 		a.setStatus(req, statusError)
@@ -168,6 +183,10 @@ func (a *Modsecurity) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		return
 	}
 	proxyReq.Header = wafHeaders(req, clientIP)
+	if !inspectBody {
+		proxyReq.Header.Del("Content-Type")
+		proxyReq.Header.Del("Content-Encoding")
+	}
 	proxyReq.Host = req.Host
 
 	resp, err := a.httpClient.Do(proxyReq)
@@ -207,14 +226,82 @@ func (a *Modsecurity) setStatus(req *http.Request, status string) {
 	}
 }
 
-func (a *Modsecurity) readBody(req *http.Request) ([]byte, error) {
-	if req.Body == nil {
-		return nil, nil
+var errBodyTooLarge = errors.New("request body too large")
+
+// readBody buffers the body for the WAF. A body above maxInspectedBodySize is
+// streamed to the service instead and reported as not inspected.
+func (a *Modsecurity) readBody(req *http.Request) ([]byte, bool, error) {
+	if req.Body == nil || req.Body == http.NoBody {
+		return nil, true, nil
 	}
-	if a.maxBodySize <= 0 {
-		return io.ReadAll(req.Body)
+	limit := smallestLimit(a.maxBodySize, a.maxInspectedBodySize)
+	reader := req.Body
+	var source io.Reader = reader
+	if limit > 0 {
+		source = io.LimitReader(reader, limit+1)
 	}
-	return io.ReadAll(io.LimitReader(req.Body, a.maxBodySize+1))
+	body, err := io.ReadAll(source)
+	if err != nil {
+		return nil, false, err
+	}
+	size := int64(len(body))
+	if a.maxBodySize > 0 && size > a.maxBodySize {
+		return nil, false, errBodyTooLarge
+	}
+	if a.maxInspectedBodySize > 0 && size > a.maxInspectedBodySize {
+		req.Body = readCloser{Reader: io.MultiReader(bytes.NewReader(body), reader), Closer: reader}
+		a.limitBody(req)
+		return nil, false, nil
+	}
+	req.Body = io.NopCloser(bytes.NewReader(body))
+	return body, true, nil
+}
+
+// limitBody fails the read of a streamed body once it exceeds maxBodySize.
+func (a *Modsecurity) limitBody(req *http.Request) {
+	if a.maxBodySize <= 0 || req.Body == nil || req.Body == http.NoBody {
+		return
+	}
+	req.Body = &limitedBody{body: req.Body, remaining: a.maxBodySize}
+}
+
+func smallestLimit(limits ...int64) int64 {
+	var smallest int64
+	for _, limit := range limits {
+		if limit > 0 && (smallest == 0 || limit < smallest) {
+			smallest = limit
+		}
+	}
+	return smallest
+}
+
+type readCloser struct {
+	io.Reader
+	io.Closer
+}
+
+type limitedBody struct {
+	body      io.ReadCloser
+	remaining int64
+}
+
+func (l *limitedBody) Read(p []byte) (int, error) {
+	if l.remaining < 0 {
+		return 0, errBodyTooLarge
+	}
+	if int64(len(p)) > l.remaining+1 {
+		p = p[:l.remaining+1]
+	}
+	n, err := l.body.Read(p)
+	l.remaining -= int64(n)
+	if l.remaining < 0 {
+		return n, errBodyTooLarge
+	}
+	return n, err
+}
+
+func (l *limitedBody) Close() error {
+	return l.body.Close()
 }
 
 // wafHeaders copies the request headers for the WAF, without hop-by-hop headers,

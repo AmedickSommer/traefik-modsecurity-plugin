@@ -22,6 +22,7 @@ services:
       - "traefik.http.middlewares.waf.plugin.traefik-modsecurity-plugin.timeoutMillis=30000"
       - "traefik.http.middlewares.waf.plugin.traefik-modsecurity-plugin.maxBodySize=${WAF_MAX_BODY_SIZE:-1048576}"
       - "traefik.http.middlewares.waf.plugin.traefik-modsecurity-plugin.statusHeader=X-Waf-Status"
+      - "traefik.http.middlewares.waf.plugin.traefik-modsecurity-plugin.maxInspectedBodySize=100000"
 
   waf:
     image: owasp/modsecurity-crs:nginx

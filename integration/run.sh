@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# Starts the stack from docker-compose.yml and checks the WAF end to end.
+set -uo pipefail
+cd "$(dirname "$0")"
+base="http://127.0.0.1:18080"
+fail=0
+
+docker compose up -d --quiet-pull >/dev/null 2>&1
+trap 'docker compose down -v >/dev/null 2>&1' EXIT
+for _ in $(seq 1 60); do
+  [ "$(curl -s -o /dev/null -w '%{http_code}' "$base/")" = "200" ] && break
+  sleep 1
+done
+
+check() {
+  local name="$1" want="$2"; shift 2
+  local got
+  got="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$@")"
+  if [ "$got" = "$want" ]; then
+    printf 'ok    %-45s %s\n' "$name" "$got"
+  else
+    printf 'FAIL  %-45s got %s, want %s\n' "$name" "$got" "$want"
+    fail=1
+  fi
+}
+
+ws=(-H 'Connection: Upgrade' -H 'Upgrade: websocket' -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==')
+traversal='/?f=..%2F..%2F..%2F..%2Fetc%2Fpasswd'
+
+check 'clean request'                        200 "$base/"
+check 'attack'                               403 "$base$traversal"
+check 'attack + Upgrade: websocket'          403 -H 'Upgrade: websocket' "$base$traversal"
+check 'attack + full websocket handshake'    403 "${ws[@]}" "$base/echo$traversal"
+check 'clean websocket handshake'            101 "${ws[@]}" "$base/echo"
+check 'body within maxBodySize'              200 --data-binary @<(head -c 1000 /dev/zero | tr '\0' a) "$base/"
+check 'body above maxBodySize'               413 --data-binary @<(head -c 2000000 /dev/zero | tr '\0' a) "$base/"
+
+if [ "$fail" -ne 0 ]; then
+  docker compose logs traefik | tail -20
+fi
+exit "$fail"

@@ -1,0 +1,52 @@
+# Mirrors the AmedickSommer docker-prod setup with the plugin loaded from this checkout.
+services:
+  traefik:
+    image: traefik
+    ports:
+      - "127.0.0.1:18080:80"
+    command:
+      - "--log.level=INFO"
+      - "--providers.docker=true"
+      - "--providers.docker.exposedByDefault=false"
+      - "--entrypoints.web.address=:80"
+      - "--experimental.localPlugins.traefik-modsecurity-plugin.moduleName=github.com/AmedickSommer/traefik-modsecurity-plugin"
+    volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock:ro"
+      - "..:/plugins-local/src/github.com/AmedickSommer/traefik-modsecurity-plugin:ro"
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.middlewares.waf.plugin.traefik-modsecurity-plugin.modSecurityUrl=http://waf:8080"
+      - "traefik.http.middlewares.waf.plugin.traefik-modsecurity-plugin.timeoutMillis=30000"
+      - "traefik.http.middlewares.waf.plugin.traefik-modsecurity-plugin.maxBodySize=${WAF_MAX_BODY_SIZE:-1048576}"
+
+  waf:
+    image: owasp/modsecurity-crs:nginx
+    restart: unless-stopped
+    depends_on:
+      - dummy
+    environment:
+      - "ACCESSLOG=/dev/null"
+      - "SERVERNAME=localhost"
+      - "PARANOIA=1"
+      - "BLOCKING_PARANOIA=1"
+      - "ANOMALY_INBOUND=10"
+      - "ANOMALY_OUTBOUND=5"
+      - "REPORTING_LEVEL=2"
+      - "BACKEND=http://dummy"
+
+  # Must answer 200 for every path; traefik/whoami rejects /echo, /health and friends.
+  dummy:
+    image: nginx:alpine
+    command:
+      - "/bin/sh"
+      - "-c"
+      - "echo 'server { listen 80 default_server; location / { return 200 ok; } }' > /etc/nginx/conf.d/default.conf && exec nginx -g 'daemon off;'"
+
+  app:
+    image: traefik/whoami
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.app.rule=PathPrefix(`/`)"
+      - "traefik.http.routers.app.entrypoints=web"
+      - "traefik.http.routers.app.middlewares=waf@docker"
+      - "traefik.http.services.app.loadbalancer.server.port=80"

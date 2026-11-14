@@ -160,6 +160,13 @@ func (a *Modsecurity) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode >= 500 {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		a.logger.Printf("modsec answered with status %d, rejecting request", resp.StatusCode)
+		http.Error(rw, "", http.StatusBadGateway)
+		return
+	}
+
 	if resp.StatusCode >= 400 {
 		if resp.StatusCode == http.StatusForbidden && a.jailEnabled {
 			a.recordOffense(clientIP)

@@ -214,3 +214,26 @@ func TestBlockResponseKeepsOnlyStatusContentTypeAndBody(t *testing.T) {
 	assert.Empty(t, rw.Header().Get("Access-Control-Allow-Origin"))
 	assert.Equal(t, "<h1>403 Forbidden</h1>", rw.Body.String())
 }
+
+func TestWafServerErrorIsAnEmptyBadGatewayAndSkipsBackend(t *testing.T) {
+	waf := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte("nginx error page"))
+	}))
+	t.Cleanup(waf.Close)
+
+	var backendCalled bool
+	config := CreateConfig()
+	config.ModSecurityUrl = waf.URL
+	handler, err := New(context.Background(), http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		backendCalled = true
+	}), config, "test")
+	require.NoError(t, err)
+
+	rw := httptest.NewRecorder()
+	handler.ServeHTTP(rw, httptest.NewRequest(http.MethodGet, "http://example.com/", nil))
+
+	assert.Equal(t, http.StatusBadGateway, rw.Code)
+	assert.NotContains(t, rw.Body.String(), "nginx error page")
+	assert.False(t, backendCalled)
+}

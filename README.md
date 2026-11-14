@@ -1,70 +1,86 @@
-# Traefik Modsecurity Plugin
+# Traefik ModSecurity Plugin
 
 ![Banner](./img/banner.png)
 
-this is a fork of the original: https://github.com/acouvreur/traefik-modsecurity-plugin
+Traefik middleware that checks every request with an
+[OWASP ModSecurity CRS](https://hub.docker.com/r/owasp/modsecurity-crs)
+container before it reaches the service.
 
-This fork introduces alpine images, CRS 4.x suppport, a custom http.transport, and a 429 jail for repeat offenders
-
-see:  https://github.com/traefik/plugindemo#troubleshooting
-
-----
-
-Traefik plugin to proxy requests to [owasp/modsecurity-crs](https://hub.docker.com/r/owasp/modsecurity-crs):apache
-
-![Github Actions](https://img.shields.io/github/actions/workflow/status/madebymode/traefik-modsecurity-plugin/build.yml?style=flat-square&branch=main)
-![Go Report](https://goreportcard.com/badge/github.com/madebymode/traefik-modsecurity-plugin?style=flat-square)
-![Go Version](https://img.shields.io/github/go-mod/go-version/madebymode/traefik-modsecurity-plugin?style=flat-square)
-![Latest Release](https://img.shields.io/github/release/madebymode/traefik-modsecurity-plugin/all.svg?style=flat-square)
-
-- [Traefik Modsecurity Plugin](#traefik-modsecurity-plugin)
-    - [Demo](#demo)
-    - [Usage (docker-compose.yml)](#usage-docker-composeyml)
-    - [How it works](#how-it-works)
-    - [Local development (docker-compose.local.yml)](#local-development-docker-composelocalyml)
-
-## Demo
-
-Demo with WAF intercepting relative access in query param.
-
-![Demo](./img/waf.gif)
-
-## Usage (docker-compose.yml)
-
-See [docker-compose.yml](docker-compose.yml)
-
-1. docker-compose up
-2. Go to http://localhost/website, the request is received without warnings
-3. Go to http://localhost/website?test=../etc, the request is intercepted and returned with 403 Forbidden by
-   owasp/modsecurity
-4. You can you bypass the WAF and check attacks at http://localhost/bypass?test=../etc
+Maintained by AmedickSommer. Forked from
+[madebymode/traefik-modsecurity-plugin](https://github.com/madebymode/traefik-modsecurity-plugin)
+v1.6.0, which in turn forked
+[acouvreur/traefik-modsecurity-plugin](https://github.com/acouvreur/traefik-modsecurity-plugin).
 
 ## How it works
 
-This is a very simple plugin that proxies the query to the owasp/modsecurity apache container.
+1. The plugin reads the request body and sends a copy of the request to the
+   WAF container (`modSecurityUrl`).
+2. The WAF runs the CRS rules and forwards clean requests to a dummy backend
+   that always answers `200`.
+3. If the WAF answers with a status of `400` or higher, that response goes to
+   the client. Otherwise the original request continues to the service.
+4. If the WAF cannot be reached in time, the client gets `502`.
 
-The plugin checks that the response from the waf container hasn't an http code > 400 before forwarding the request to
-the real service.
+Every request is inspected, including websocket handshakes. Hop-by-hop
+headers such as `Upgrade` and `Connection` are removed from the copy, so the
+WAF checks a handshake as a plain `GET`; the service still receives the
+original upgrade.
 
-If it is > 400, then the error page is returned instead.
-
-The *dummy* service is created so the waf container forward the request to a service and respond with 200 OK all the
-time.
+The WAF sees the original `Host` header. `X-Forwarded-For`,
+`X-Forwarded-Host` and `X-Forwarded-Proto` are passed through, or set from
+the request when Traefik has not set them.
 
 ## Configuration
 
-This plugin supports these configuration:
+| Option                           | Default | Description                                         |
+|----------------------------------|---------|-----------------------------------------------------|
+| `modSecurityUrl`                 | –       | URL of the WAF container (required)                 |
+| `timeoutMillis`                  | `2000`  | Timeout for the call to the WAF                     |
+| `maxBodySize`                    | `0`     | Larger request bodies get `413`; `0` is unlimited   |
+| `jailEnabled`                    | `false` | Answer `429` to clients with repeated WAF blocks    |
+| `badRequestsThresholdCount`      | `25`    | Number of `403`s that put a client in jail          |
+| `badRequestsThresholdPeriodSecs` | `600`   | Period in which the `403`s are counted              |
+| `jailTimeDurationSecs`           | `600`   | How long a client stays in jail                     |
 
-* `modSecurityUrl`: (**mandatory**) it's the URL for the owasp/modsecurity container.
-* `timeoutMillis`: (optional) timeout in milliseconds for the http client to talk with modsecurity container. (default 2
-  seconds)
-* `jailEnabled`:  (optional) 429 jail for repeat offenders (based on threshold settings)
-* `JailTimeDurationSecs`:  (optional) how long a client will be jailed for, in seconds
-* `badRequestsThresholdCount`: (optional) # of 403s a clientIP can trigger from OWASP before being adding to jail
-* `badRequestsThresholdPeriodSecs` (optional) # the period, in seconds, that the threshold must meet before a client is added to the 429 jail
+Request bodies are held in memory while the WAF checks them, so set
+`maxBodySize` on public routers.
 
-## Local development (docker-compose.local.yml)
+The dummy backend must answer `200` for every path. `traefik/whoami` does
+not: it handles `/echo`, `/health` and others itself, so requests to these
+paths fail.
 
-See [docker-compose.local.yml](docker-compose.local.yml)
+## Installation
 
-`docker-compose -f docker-compose.local.yml up` to load the local plugin
+```yaml
+command:
+  - "--experimental.plugins.traefik-modsecurity-plugin.modulename=github.com/AmedickSommer/traefik-modsecurity-plugin"
+  - "--experimental.plugins.traefik-modsecurity-plugin.version=v1.0.0"
+```
+
+```yaml
+http:
+  middlewares:
+    waf:
+      plugin:
+        traefik-modsecurity-plugin:
+          modSecurityUrl: http://waf:8080
+          timeoutMillis: 30000
+          maxBodySize: 768000000
+```
+
+See [docker-compose.yml](docker-compose.yml) for a complete example.
+
+## Development
+
+```bash
+go test -race ./...
+integration/run.sh
+```
+
+`integration/run.sh` starts Traefik with the plugin from this checkout, the
+CRS WAF and a test service, then checks blocking, the websocket handshake and
+the body size limit end to end.
+
+## Licence
+
+Apache License 2.0, see [LICENSE](LICENSE).

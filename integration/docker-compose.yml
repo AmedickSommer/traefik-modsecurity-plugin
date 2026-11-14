@@ -9,6 +9,9 @@ services:
       - "--providers.docker=true"
       - "--providers.docker.exposedByDefault=false"
       - "--entrypoints.web.address=:80"
+      - "--accesslog=true"
+      - "--accesslog.format=json"
+      - "--accesslog.fields.headers.names.X-Waf-Status=keep"
       - "--experimental.localPlugins.traefik-modsecurity-plugin.moduleName=github.com/AmedickSommer/traefik-modsecurity-plugin"
     volumes:
       - "/var/run/docker.sock:/var/run/docker.sock:ro"
@@ -18,6 +21,7 @@ services:
       - "traefik.http.middlewares.waf.plugin.traefik-modsecurity-plugin.modSecurityUrl=http://waf:8080"
       - "traefik.http.middlewares.waf.plugin.traefik-modsecurity-plugin.timeoutMillis=30000"
       - "traefik.http.middlewares.waf.plugin.traefik-modsecurity-plugin.maxBodySize=${WAF_MAX_BODY_SIZE:-1048576}"
+      - "traefik.http.middlewares.waf.plugin.traefik-modsecurity-plugin.statusHeader=X-Waf-Status"
 
   waf:
     image: owasp/modsecurity-crs:nginx

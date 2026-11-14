@@ -40,6 +40,7 @@ the request when Traefik has not set them.
 | `modSecurityUrl`                 | –       | URL of the WAF container (required)                 |
 | `timeoutMillis`                  | `2000`  | Timeout for the call to the WAF                     |
 | `maxBodySize`                    | `0`     | Larger request bodies get `413`; `0` is unlimited   |
+| `statusHeader`                   | –       | Request header that receives the WAF outcome        |
 | `jailEnabled`                    | `false` | Answer `429` to clients with repeated WAF blocks    |
 | `badRequestsThresholdCount`      | `25`    | Number of `403`s that put a client in jail          |
 | `badRequestsThresholdPeriodSecs` | `600`   | Period in which the `403`s are counted              |
@@ -47,6 +48,14 @@ the request when Traefik has not set them.
 
 Request bodies are held in memory while the WAF checks them, so set
 `maxBodySize` on public routers.
+
+With `statusHeader` set, the plugin writes `ok`, `blocked` or `error` into
+that request header and removes any value the client sent. Traefik's access
+log records it with:
+
+```text
+--accesslog.fields.headers.names.X-Waf-Status=keep
+```
 
 The dummy backend must answer `200` for every path. `traefik/whoami` does
 not: it handles `/echo`, `/health` and others itself, so requests to these

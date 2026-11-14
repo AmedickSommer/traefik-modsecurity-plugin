@@ -21,6 +21,7 @@ type Config struct {
 	TimeoutMillis                  int64  `json:"timeoutMillis,omitempty"`
 	ModSecurityUrl                 string `json:"modSecurityUrl,omitempty"`
 	MaxBodySize                    int64  `json:"maxBodySize,omitempty"`
+	StatusHeader                   string `json:"statusHeader,omitempty"`
 	JailEnabled                    bool   `json:"jailEnabled,omitempty"`
 	BadRequestsThresholdCount      int    `json:"badRequestsThresholdCount,omitempty"`
 	BadRequestsThresholdPeriodSecs int    `json:"badRequestsThresholdPeriodSecs,omitempty"`
@@ -37,6 +38,13 @@ func CreateConfig() *Config {
 		JailTimeDurationSecs:           600,
 	}
 }
+
+// Values written to the configured status header for the Traefik access log.
+const (
+	statusOk      = "ok"
+	statusBlocked = "blocked"
+	statusError   = "error"
+)
 
 // hopHeaders apply to a single connection and must not reach the WAF.
 var hopHeaders = []string{
@@ -56,6 +64,7 @@ type Modsecurity struct {
 	next                           http.Handler
 	modSecurityUrl                 string
 	maxBodySize                    int64
+	statusHeader                   string
 	name                           string
 	httpClient                     *http.Client
 	logger                         *log.Logger
@@ -104,6 +113,7 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 	return &Modsecurity{
 		modSecurityUrl:                 config.ModSecurityUrl,
 		maxBodySize:                    config.MaxBodySize,
+		statusHeader:                   http.CanonicalHeaderKey(config.StatusHeader),
 		next:                           next,
 		name:                           name,
 		httpClient:                     &http.Client{Timeout: timeout, Transport: transport},
@@ -119,14 +129,19 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 
 func (a *Modsecurity) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	clientIP := remoteIP(req)
+	if a.statusHeader != "" {
+		req.Header.Del(a.statusHeader)
+	}
 
 	if a.jailEnabled && a.isClientInJail(clientIP) {
 		a.logger.Printf("client %s is jailed", clientIP)
+		a.setStatus(req, statusBlocked)
 		http.Error(rw, "Too Many Requests", http.StatusTooManyRequests)
 		return
 	}
 
 	if a.maxBodySize > 0 && req.ContentLength > a.maxBodySize {
+		a.setStatus(req, statusBlocked)
 		http.Error(rw, "Request Entity Too Large", http.StatusRequestEntityTooLarge)
 		return
 	}
@@ -134,10 +149,12 @@ func (a *Modsecurity) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	body, err := a.readBody(req)
 	if err != nil {
 		a.logger.Printf("fail to read incoming request: %s", err.Error())
+		a.setStatus(req, statusError)
 		http.Error(rw, "", http.StatusBadGateway)
 		return
 	}
 	if a.maxBodySize > 0 && int64(len(body)) > a.maxBodySize {
+		a.setStatus(req, statusBlocked)
 		http.Error(rw, "Request Entity Too Large", http.StatusRequestEntityTooLarge)
 		return
 	}
@@ -146,6 +163,7 @@ func (a *Modsecurity) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	proxyReq, err := http.NewRequestWithContext(req.Context(), req.Method, a.modSecurityUrl+requestURI(req), bytes.NewReader(body))
 	if err != nil {
 		a.logger.Printf("fail to prepare forwarded request: %s", err.Error())
+		a.setStatus(req, statusError)
 		http.Error(rw, "", http.StatusBadGateway)
 		return
 	}
@@ -155,6 +173,7 @@ func (a *Modsecurity) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	resp, err := a.httpClient.Do(proxyReq)
 	if err != nil {
 		a.logger.Printf("fail to send HTTP request to modsec: %s", err.Error())
+		a.setStatus(req, statusError)
 		http.Error(rw, "", http.StatusBadGateway)
 		return
 	}
@@ -163,6 +182,7 @@ func (a *Modsecurity) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	if resp.StatusCode >= 500 {
 		_, _ = io.Copy(io.Discard, resp.Body)
 		a.logger.Printf("modsec answered with status %d, rejecting request", resp.StatusCode)
+		a.setStatus(req, statusError)
 		http.Error(rw, "", http.StatusBadGateway)
 		return
 	}
@@ -171,12 +191,20 @@ func (a *Modsecurity) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		if resp.StatusCode == http.StatusForbidden && a.jailEnabled {
 			a.recordOffense(clientIP)
 		}
+		a.setStatus(req, statusBlocked)
 		forwardResponse(resp, rw)
 		return
 	}
 	_, _ = io.Copy(io.Discard, resp.Body)
 
+	a.setStatus(req, statusOk)
 	a.next.ServeHTTP(rw, req)
+}
+
+func (a *Modsecurity) setStatus(req *http.Request, status string) {
+	if a.statusHeader != "" {
+		req.Header.Set(a.statusHeader, status)
+	}
 }
 
 func (a *Modsecurity) readBody(req *http.Request) ([]byte, error) {

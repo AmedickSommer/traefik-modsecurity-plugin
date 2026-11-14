@@ -35,6 +35,24 @@ check 'clean websocket handshake'            101 "${ws[@]}" "$base/echo"
 check 'body within maxBodySize'              200 --data-binary @<(head -c 1000 /dev/zero | tr '\0' a) "$base/"
 check 'body above maxBodySize'               413 --data-binary @<(head -c 2000000 /dev/zero | tr '\0' a) "$base/"
 
+headers="$(curl -s -o /dev/null -D - --max-time 10 "$base$traversal")"
+if grep -qiE '^(server|access-control-[a-z-]+):' <<<"$headers"; then
+  printf 'FAIL  %-45s %s\n' 'block page without WAF headers' "$(grep -iE '^(server|access-control)' <<<"$headers" | tr -d '\r' | paste -sd' ')"
+  fail=1
+else
+  printf 'ok    %-45s\n' 'block page without WAF headers'
+fi
+
+logs="$(docker compose logs --no-log-prefix traefik 2>/dev/null)"
+for status in ok blocked; do
+  if grep -q "\"request_X-Waf-Status\":\"$status\"" <<<"$logs"; then
+    printf 'ok    %-45s\n' "access log shows X-Waf-Status: $status"
+  else
+    printf 'FAIL  %-45s\n' "access log shows X-Waf-Status: $status"
+    fail=1
+  fi
+done
+
 if [ "$fail" -ne 0 ]; then
   docker compose logs traefik | tail -20
 fi

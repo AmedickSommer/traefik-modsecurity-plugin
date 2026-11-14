@@ -237,3 +237,57 @@ func TestWafServerErrorIsAnEmptyBadGatewayAndSkipsBackend(t *testing.T) {
 	assert.NotContains(t, rw.Body.String(), "nginx error page")
 	assert.False(t, backendCalled)
 }
+
+func TestStatusHeaderReportsWafOutcome(t *testing.T) {
+	cases := []struct {
+		name        string
+		wafStatus   int
+		maxBodySize int64
+		body        string
+		want        string
+	}{
+		{name: "allowed", wafStatus: http.StatusOK, want: "ok"},
+		{name: "blocked by waf", wafStatus: http.StatusForbidden, want: "blocked"},
+		{name: "waf error", wafStatus: http.StatusBadGateway, want: "error"},
+		{name: "body too large", wafStatus: http.StatusOK, maxBodySize: 2, body: "abc", want: "blocked"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			config := CreateConfig()
+			config.StatusHeader = "x-waf-status"
+			config.MaxBodySize = tc.maxBodySize
+			handler, _ := newTestMiddleware(t, tc.wafStatus, config, nil)
+
+			req := httptest.NewRequest(http.MethodPost, "http://example.com/", strings.NewReader(tc.body))
+			req.Header.Set("X-Waf-Status", "forged-by-client")
+			handler.ServeHTTP(httptest.NewRecorder(), req)
+
+			assert.Equal(t, []string{tc.want}, req.Header.Values("X-Waf-Status"))
+		})
+	}
+}
+
+func TestStatusHeaderReportsUnreachableWaf(t *testing.T) {
+	config := CreateConfig()
+	config.ModSecurityUrl = "http://127.0.0.1:1"
+	config.StatusHeader = "X-Waf-Status"
+	handler, err := New(context.Background(), http.NotFoundHandler(), config, "test")
+	require.NoError(t, err)
+
+	req := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
+	rw := httptest.NewRecorder()
+	handler.ServeHTTP(rw, req)
+
+	assert.Equal(t, http.StatusBadGateway, rw.Code)
+	assert.Equal(t, "error", req.Header.Get("X-Waf-Status"))
+}
+
+func TestStatusHeaderIsNotSetWhenDisabled(t *testing.T) {
+	handler, _ := newTestMiddleware(t, http.StatusOK, nil, nil)
+
+	req := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
+	req.Header.Set("X-Waf-Status", "client-value")
+	handler.ServeHTTP(httptest.NewRecorder(), req)
+
+	assert.Equal(t, "client-value", req.Header.Get("X-Waf-Status"))
+}

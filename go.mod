@@ -1,4 +1,4 @@
-module github.com/madebymode/traefik-modsecurity-plugin
+module github.com/AmedickSommer/traefik-modsecurity-plugin
 
 go 1.21
 

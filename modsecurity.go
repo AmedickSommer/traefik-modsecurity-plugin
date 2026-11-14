@@ -19,15 +19,18 @@ import (
 
 // Config the plugin configuration.
 type Config struct {
-	TimeoutMillis                  int64  `json:"timeoutMillis,omitempty"`
-	ModSecurityUrl                 string `json:"modSecurityUrl,omitempty"`
-	MaxBodySize                    int64  `json:"maxBodySize,omitempty"`
-	MaxInspectedBodySize           int64  `json:"maxInspectedBodySize,omitempty"`
-	StatusHeader                   string `json:"statusHeader,omitempty"`
-	JailEnabled                    bool   `json:"jailEnabled,omitempty"`
-	BadRequestsThresholdCount      int    `json:"badRequestsThresholdCount,omitempty"`
-	BadRequestsThresholdPeriodSecs int    `json:"badRequestsThresholdPeriodSecs,omitempty"`
-	JailTimeDurationSecs           int    `json:"jailTimeDurationSecs,omitempty"`
+	TimeoutMillis                  int64    `json:"timeoutMillis,omitempty"`
+	ModSecurityUrl                 string   `json:"modSecurityUrl,omitempty"`
+	MaxBodySize                    int64    `json:"maxBodySize,omitempty"`
+	MaxInspectedBodySize           int64    `json:"maxInspectedBodySize,omitempty"`
+	StatusHeader                   string   `json:"statusHeader,omitempty"`
+	RuleSets                       []string `json:"ruleSets,omitempty"`
+	DisableRules                   []string `json:"disableRules,omitempty"`
+	Rules                          []Rule   `json:"rules,omitempty"`
+	JailEnabled                    bool     `json:"jailEnabled,omitempty"`
+	BadRequestsThresholdCount      int      `json:"badRequestsThresholdCount,omitempty"`
+	BadRequestsThresholdPeriodSecs int      `json:"badRequestsThresholdPeriodSecs,omitempty"`
+	JailTimeDurationSecs           int      `json:"jailTimeDurationSecs,omitempty"`
 }
 
 // CreateConfig creates the default plugin configuration.
@@ -46,6 +49,7 @@ const (
 	statusOk      = "ok"
 	statusBlocked = "blocked"
 	statusError   = "error"
+	statusSkipped = "skipped"
 )
 
 // hopHeaders apply to a single connection and must not reach the WAF.
@@ -68,6 +72,7 @@ type Modsecurity struct {
 	maxBodySize                    int64
 	maxInspectedBodySize           int64
 	statusHeader                   string
+	rules                          []compiledRule
 	name                           string
 	httpClient                     *http.Client
 	logger                         *log.Logger
@@ -89,6 +94,13 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 		return nil, fmt.Errorf("maxBodySize and maxInspectedBodySize cannot be negative")
 	}
 	logger := log.New(os.Stdout, "", log.LstdFlags)
+	rules, warnings, err := buildRules(config.Rules, config.RuleSets, config.DisableRules)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", name, err)
+	}
+	for _, warning := range warnings {
+		logger.Printf("%s: %s", name, warning)
+	}
 
 	timeout := 2 * time.Second
 	if config.TimeoutMillis != 0 {
@@ -119,6 +131,7 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 		maxBodySize:                    config.MaxBodySize,
 		maxInspectedBodySize:           config.MaxInspectedBodySize,
 		statusHeader:                   http.CanonicalHeaderKey(config.StatusHeader),
+		rules:                          rules,
 		next:                           next,
 		name:                           name,
 		httpClient:                     &http.Client{Timeout: timeout, Transport: transport},
@@ -145,13 +158,26 @@ func (a *Modsecurity) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	action := a.matchRule(req, clientIP)
+	switch action {
+	case ActionBlock:
+		a.setStatus(req, statusBlocked)
+		http.Error(rw, "Forbidden", http.StatusForbidden)
+		return
+	case ActionSkipWaf:
+		a.setStatus(req, statusSkipped)
+		a.next.ServeHTTP(rw, req)
+		return
+	}
+
 	if a.maxBodySize > 0 && req.ContentLength > a.maxBodySize {
 		a.setStatus(req, statusBlocked)
 		http.Error(rw, "Request Entity Too Large", http.StatusRequestEntityTooLarge)
 		return
 	}
 
-	inspectBody := a.maxInspectedBodySize <= 0 || req.ContentLength <= a.maxInspectedBodySize
+	inspectBody := action != ActionSkipBody &&
+		(a.maxInspectedBodySize <= 0 || req.ContentLength <= a.maxInspectedBodySize)
 	var body []byte
 	if inspectBody {
 		var err error
@@ -224,6 +250,30 @@ func (a *Modsecurity) setStatus(req *http.Request, status string) {
 	if a.statusHeader != "" {
 		req.Header.Set(a.statusHeader, status)
 	}
+}
+
+// matchRule returns the action of the first matching rule; logOnly rules are
+// reported and skipped.
+func (a *Modsecurity) matchRule(req *http.Request, clientIP string) string {
+	if len(a.rules) == 0 {
+		return ""
+	}
+	path := normalizedPath(req)
+	for i := range a.rules {
+		rule := &a.rules[i]
+		if !rule.matches(req, path, clientIP) {
+			continue
+		}
+		if rule.logOnly {
+			a.logger.Printf("rule %s would %s %s %s from %s", rule.name, rule.action, req.Method, req.URL.Path, clientIP)
+			continue
+		}
+		if rule.action == ActionBlock {
+			a.logger.Printf("rule %s blocked %s %s from %s", rule.name, req.Method, req.URL.Path, clientIP)
+		}
+		return rule.action
+	}
+	return ""
 }
 
 var errBodyTooLarge = errors.New("request body too large")

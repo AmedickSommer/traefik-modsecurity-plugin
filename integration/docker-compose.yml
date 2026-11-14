@@ -8,6 +8,7 @@ services:
       - "--log.level=INFO"
       - "--providers.docker=true"
       - "--providers.docker.exposedByDefault=false"
+      - "--providers.file.filename=/etc/traefik/dynamic.yml"
       - "--entrypoints.web.address=:80"
       - "--accesslog=true"
       - "--accesslog.format=json"
@@ -16,13 +17,7 @@ services:
     volumes:
       - "/var/run/docker.sock:/var/run/docker.sock:ro"
       - "..:/plugins-local/src/github.com/AmedickSommer/traefik-modsecurity-plugin:ro"
-    labels:
-      - "traefik.enable=true"
-      - "traefik.http.middlewares.waf.plugin.traefik-modsecurity-plugin.modSecurityUrl=http://waf:8080"
-      - "traefik.http.middlewares.waf.plugin.traefik-modsecurity-plugin.timeoutMillis=30000"
-      - "traefik.http.middlewares.waf.plugin.traefik-modsecurity-plugin.maxBodySize=${WAF_MAX_BODY_SIZE:-1048576}"
-      - "traefik.http.middlewares.waf.plugin.traefik-modsecurity-plugin.statusHeader=X-Waf-Status"
-      - "traefik.http.middlewares.waf.plugin.traefik-modsecurity-plugin.maxInspectedBodySize=100000"
+      - "./dynamic.yml:/etc/traefik/dynamic.yml:ro"
 
   waf:
     image: owasp/modsecurity-crs:nginx
@@ -53,5 +48,5 @@ services:
       - "traefik.enable=true"
       - "traefik.http.routers.app.rule=PathPrefix(`/`)"
       - "traefik.http.routers.app.entrypoints=web"
-      - "traefik.http.routers.app.middlewares=waf@docker"
+      - "traefik.http.routers.app.middlewares=waf@file"
       - "traefik.http.services.app.loadbalancer.server.port=80"

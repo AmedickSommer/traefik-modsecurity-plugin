@@ -1,0 +1,21 @@
+http:
+  middlewares:
+    waf:
+      plugin:
+        traefik-modsecurity-plugin:
+          modSecurityUrl: http://waf:8080
+          timeoutMillis: 30000
+          maxBodySize: 1048576
+          maxInspectedBodySize: 100000
+          statusHeader: X-Waf-Status
+          ruleSets:
+            - typo3
+          disableRules:
+            - basic/block-user-agents
+          rules:
+            - name: powermail-uploads
+              action: block
+              path: '^/uploads/tx_powermail/'
+            - name: skip-test
+              action: skip-waf
+              path: '^/skip/'

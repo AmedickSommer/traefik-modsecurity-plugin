@@ -42,6 +42,9 @@ the request when Traefik has not set them.
 | `maxBodySize`                    | `0`     | Larger request bodies get `413`; `0` is unlimited   |
 | `maxInspectedBodySize`           | `0`     | Larger bodies skip WAF inspection; `0` is unlimited |
 | `statusHeader`                   | –       | Request header that receives the WAF outcome        |
+| `ruleSets`                       | –       | Shipped rule sets to apply, see [Rules](#rules)     |
+| `disableRules`                   | –       | Names of shipped rules to switch off                |
+| `rules`                          | –       | Project rules, see [Rules](#rules)                  |
 | `jailEnabled`                    | `false` | Answer `429` to clients with repeated WAF blocks    |
 | `badRequestsThresholdCount`      | `25`    | Number of `403`s that put a client in jail          |
 | `badRequestsThresholdPeriodSecs` | `600`   | Period in which the `403`s are counted              |
@@ -55,8 +58,8 @@ checks method, URL and headers only, and the body is streamed to the service.
 A streamed body that grows beyond `maxBodySize` is cut off with an error,
 since the `413` can only be sent before streaming starts.
 
-With `statusHeader` set, the plugin writes `ok`, `blocked` or `error`
-into that request header and removes any value the client sent. Traefik's access
+With `statusHeader` set, the plugin writes `ok`, `blocked`, `error` or
+`skipped` into that request header and removes any value the client sent. Traefik's access
 log records it with:
 
 ```text
@@ -66,6 +69,64 @@ log records it with:
 The dummy backend must answer `200` for every path. `traefik/whoami` does
 not: it handles `/echo`, `/health` and others itself, so requests to these
 paths fail.
+
+## Rules
+
+Rules block requests before they reach the WAF, or take them out of WAF
+inspection. Project rules are checked first, then the rules of the selected
+sets; the first matching rule decides.
+
+```yaml
+ruleSets:
+  - typo3                         # includes basic
+disableRules:
+  - basic/block-user-agents
+rules:
+  - name: typo3/limit-methods     # replaces the shipped rule of that name
+    action: block
+    methodNot: [GET, HEAD, POST, PUT]
+  - name: powermail-uploads
+    action: block
+    path: '^/uploads/tx_powermail/'
+  - name: monitoring
+    action: skip-waf
+    path: '^/healthz$'
+    clientIp: ['10.0.0.0/8']
+```
+
+| Action      | Effect                                                         |
+|-------------|----------------------------------------------------------------|
+| `block`     | `403` without asking the WAF; status `blocked`                 |
+| `skip-body` | The WAF checks method, URL and headers, but not the body       |
+| `skip-waf`  | The request goes to the service unchecked; status `skipped`    |
+
+Set `logOnly: true` on a rule to only log what it would do.
+
+| Condition     | Matches                                                      |
+|---------------|--------------------------------------------------------------|
+| `method`      | One of the listed methods                                    |
+| `methodNot`   | None of the listed methods                                   |
+| `path`        | Regular expression on the decoded path                       |
+| `pathNot`     | Path does not match this regular expression                  |
+| `query`       | Regular expression on the raw query string                   |
+| `header`      | Header is present; with `headerValue`, a value matches it    |
+| `clientIp`    | Client address in one of the listed IPs or CIDR ranges       |
+
+All conditions set on a rule must match. Regular expressions use Go syntax:
+no lookarounds, `(?i)` for case-insensitive matching. Repeated slashes in the
+path are collapsed before matching.
+
+Shipped sets mirror the security configuration of the AmedickSommer
+`php-nginx` base image; see `rules.go` for every rule:
+
+| Set     | Rules                                                                 |
+|---------|-----------------------------------------------------------------------|
+| `basic` | `basic/dot-files`, `basic/development-files`, `basic/block-user-agents` |
+| `typo3` | `basic` plus `typo3/backend-file-upload` (`skip-body`), `typo3/limit-methods` and blocks for scripts in upload folders, flexforms, locallang, static TypoScript, protected files, recycler and temp folders, fileadmin templates, libraries, protected extension folders, the local configuration and distribution files |
+
+A misspelled name in `disableRules` is logged and ignored. Invalid rules or
+unknown sets stop the middleware from loading, so Traefik drops the routers
+that use it: check the Traefik log after every change.
 
 ## Installation
 

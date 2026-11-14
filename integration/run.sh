@@ -35,6 +35,14 @@ check 'clean websocket handshake'            101 "${ws[@]}" "$base/echo"
 check 'body within maxBodySize'              200 --data-binary @<(head -c 1000 /dev/zero | tr '\0' a) "$base/"
 check 'body above maxBodySize'               413 --data-binary @<(head -c 2000000 /dev/zero | tr '\0' a) "$base/"
 
+check 'rule: dot file'                        403 "$base/.git/config"
+check 'rule: .well-known stays reachable'      200 "$base/.well-known/acme-challenge/x"
+check 'rule: PUT outside allowed methods'      403 -X PUT "$base/"
+check 'rule: project block rule'               403 "$base/uploads/tx_powermail/cv.pdf"
+check 'rule: disabled user-agent rule'         200 -A 'libwww-perl/6.0' "$base/"
+check 'rule: skip-waf passes attack'           200 "$base/skip$traversal"
+check 'skip-body: attack in body passes'       200 --data 'f=../../../../etc/passwd' "$base/typo3/ajax/file/process"
+check 'skip-body: attack in URL is blocked'    403 --data 'a=b' "$base/typo3/ajax/file/process$traversal"
 check 'small body: attack is blocked'          403 --data 'f=../../../../etc/passwd' "$base/"
 check 'large body: not inspected, passes'      200 --data-binary @<(printf 'f=../../../../etc/passwd&p='; head -c 200000 /dev/zero | tr '\0' a) "$base/"
 check 'large body: attack in URL is blocked'   403 --data-binary @<(head -c 200000 /dev/zero | tr '\0' a) "$base$traversal"
@@ -48,7 +56,7 @@ else
 fi
 
 logs="$(docker compose logs --no-log-prefix traefik 2>/dev/null)"
-for status in ok blocked; do
+for status in ok blocked skipped; do
   if grep -q "\"request_X-Waf-Status\":\"$status\"" <<<"$logs"; then
     printf 'ok    %-45s\n' "access log shows X-Waf-Status: $status"
   else

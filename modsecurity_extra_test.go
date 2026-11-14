@@ -189,3 +189,28 @@ func TestAbsoluteFormRequestTargetIsInspected(t *testing.T) {
 	assert.Equal(t, http.StatusForbidden, rw.Code)
 	assert.Equal(t, "/a?f=..%2Fetc", uri)
 }
+
+func TestBlockResponseKeepsOnlyStatusContentTypeAndBody(t *testing.T) {
+	waf := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Server", "nginx")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Content-Type", "text/html")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte("<h1>403 Forbidden</h1>"))
+	}))
+	t.Cleanup(waf.Close)
+
+	config := CreateConfig()
+	config.ModSecurityUrl = waf.URL
+	handler, err := New(context.Background(), http.NotFoundHandler(), config, "test")
+	require.NoError(t, err)
+
+	rw := httptest.NewRecorder()
+	handler.ServeHTTP(rw, httptest.NewRequest(http.MethodGet, "http://example.com/", nil))
+
+	assert.Equal(t, http.StatusForbidden, rw.Code)
+	assert.Equal(t, "text/html", rw.Header().Get("Content-Type"))
+	assert.Empty(t, rw.Header().Get("Server"))
+	assert.Empty(t, rw.Header().Get("Access-Control-Allow-Origin"))
+	assert.Equal(t, "<h1>403 Forbidden</h1>", rw.Body.String())
+}

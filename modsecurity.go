@@ -233,11 +233,11 @@ func remoteIP(req *http.Request) string {
 	return host
 }
 
+// forwardResponse sends the WAF's block page with its status and content type only;
+// headers such as Server or CORS from the WAF's nginx must not reach the client.
 func forwardResponse(resp *http.Response, rw http.ResponseWriter) {
-	for k, vv := range resp.Header {
-		for _, v := range vv {
-			rw.Header().Add(k, v)
-		}
+	if contentType := resp.Header.Get("Content-Type"); contentType != "" {
+		rw.Header().Set("Content-Type", contentType)
 	}
 	rw.WriteHeader(resp.StatusCode)
 	_, _ = io.Copy(rw, resp.Body)

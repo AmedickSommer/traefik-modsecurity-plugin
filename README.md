@@ -17,8 +17,10 @@ v1.6.0, which in turn forked
    WAF container (`modSecurityUrl`).
 2. The WAF runs the CRS rules and forwards clean requests to a dummy backend
    that always answers `200`.
-3. If the WAF answers with a status of `400` or higher, that response goes to
-   the client. Otherwise the original request continues to the service.
+3. If the WAF answers with a status of `400` or higher, its block page goes to
+   the client with only the status, `Content-Type` and body. Headers set by
+   the WAF's web server, such as `Server` or CORS headers, are dropped.
+   Otherwise the original request continues to the service.
 4. If the WAF cannot be reached in time, the client gets `502`.
 
 Every request is inspected, including websocket handshakes. Hop-by-hop

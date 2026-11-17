@@ -99,8 +99,41 @@ rules:
 | `block`     | `403` without asking the WAF; status `blocked`                 |
 | `skip-body` | The WAF checks method, URL and headers, but not the body       |
 | `skip-waf`  | The request goes to the service unchecked; status `skipped`    |
+| `rate-limit`| Counts matching requests, jails clients above the limit        |
 
 Set `logOnly: true` on a rule to only log what it would do.
+
+### Rate limits
+
+```yaml
+rules:
+  - name: donation-flood
+    action: rate-limit
+    method: [POST]
+    path: '^/spenden'
+    limit: 9               # requests allowed per period
+    limitPeriodSecs: 60
+    limitBy: ip-fingerprint
+    jailSecs: 600
+```
+
+A `rate-limit` rule counts the matching requests per client in a sliding
+window. Within the limit the next rules apply as usual. The request above
+the limit jails the client: it gets `429` for every request through this
+middleware until `jailSecs` have passed (default: `limitPeriodSecs`).
+
+| `limitBy`        | A client is                                          |
+|------------------|------------------------------------------------------|
+| `ip` (default)   | The client IP                                        |
+| `ip-fingerprint` | The client IP plus `User-Agent`, `Accept`,           |
+|                  | `Accept-Language`, `Accept-Encoding`, `Sec-Ch-Ua*`   |
+
+`ip-fingerprint` keeps visitors behind one carrier NAT apart, but a bot that
+changes its headers gets a new counter each time. Pair it with an IP-only
+limit, e.g. Traefik's `rateLimit` middleware with a higher threshold.
+
+Counters and jail live in memory per middleware instance; a change to the
+dynamic configuration starts them empty.
 
 | Condition     | Matches                                                      |
 |---------------|--------------------------------------------------------------|

@@ -151,7 +151,7 @@ func (a *Modsecurity) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		req.Header.Del(a.statusHeader)
 	}
 
-	if a.jailEnabled && a.isClientInJail(clientIP) {
+	if (a.jailEnabled && a.isClientInJail(clientIP)) || a.isRateLimitJailed(req, clientIP) {
 		a.logger.Printf("client %s is jailed", clientIP)
 		a.setStatus(req, statusBlocked)
 		http.Error(rw, "Too Many Requests", http.StatusTooManyRequests)
@@ -160,6 +160,10 @@ func (a *Modsecurity) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 
 	action := a.matchRule(req, clientIP)
 	switch action {
+	case ActionRateLimit:
+		a.setStatus(req, statusBlocked)
+		http.Error(rw, "Too Many Requests", http.StatusTooManyRequests)
+		return
 	case ActionBlock:
 		a.setStatus(req, statusBlocked)
 		http.Error(rw, "Forbidden", http.StatusForbidden)
@@ -252,8 +256,20 @@ func (a *Modsecurity) setStatus(req *http.Request, status string) {
 	}
 }
 
-// matchRule returns the action of the first matching rule; logOnly rules are
-// reported and skipped.
+// isRateLimitJailed reports whether a rate-limit rule jailed the client; the
+// jail covers every request through this middleware.
+func (a *Modsecurity) isRateLimitJailed(req *http.Request, clientIP string) bool {
+	for i := range a.rules {
+		rule := &a.rules[i]
+		if rule.limiter != nil && !rule.logOnly && rule.limiter.isJailed(rule.limiter.key(req, clientIP)) {
+			return true
+		}
+	}
+	return false
+}
+
+// matchRule returns the action of the first matching rule; logOnly rules and
+// rate-limit rules within their limit are skipped.
 func (a *Modsecurity) matchRule(req *http.Request, clientIP string) string {
 	if len(a.rules) == 0 {
 		return ""
@@ -263,6 +279,18 @@ func (a *Modsecurity) matchRule(req *http.Request, clientIP string) string {
 		rule := &a.rules[i]
 		if !rule.matches(req, path, clientIP) {
 			continue
+		}
+		if rule.limiter != nil {
+			key := rule.limiter.key(req, clientIP)
+			if !rule.limiter.hit(key, !rule.logOnly) {
+				continue
+			}
+			if rule.logOnly {
+				a.logger.Printf("rule %s would jail %s for %s %s, User-Agent %q", rule.name, key, req.Method, req.URL.Path, req.UserAgent())
+				continue
+			}
+			a.logger.Printf("rule %s jailed %s for %s after %s %s, User-Agent %q", rule.name, key, rule.limiter.jailTime, req.Method, req.URL.Path, req.UserAgent())
+			return rule.action
 		}
 		if rule.logOnly {
 			a.logger.Printf("rule %s would %s %s %s from %s", rule.name, rule.action, req.Method, req.URL.Path, clientIP)

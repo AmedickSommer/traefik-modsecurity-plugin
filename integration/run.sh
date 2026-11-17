@@ -47,6 +47,12 @@ check 'small body: attack is blocked'          403 --data 'f=../../../../etc/pas
 check 'large body: not inspected, passes'      200 --data-binary @<(printf 'f=../../../../etc/passwd&p='; head -c 200000 /dev/zero | tr '\0' a) "$base/"
 check 'large body: attack in URL is blocked'   403 --data-binary @<(head -c 200000 /dev/zero | tr '\0' a) "$base$traversal"
 
+check 'rate-limit: 1st POST'                  200 -A rate-bot --data a=b "$base/rate/x"
+check 'rate-limit: 2nd POST'                  200 -A rate-bot --data a=b "$base/rate/x"
+check 'rate-limit: 3rd POST is jailed'        429 -A rate-bot --data a=b "$base/rate/x"
+check 'rate-limit: jail covers other paths'   429 -A rate-bot "$base/"
+check 'rate-limit: other browser, same IP'    200 -A rate-browser --data a=b "$base/rate/x"
+
 headers="$(curl -s -o /dev/null -D - --max-time 10 "$base$traversal")"
 if grep -qiE '^(server|access-control-[a-z-]+):' <<<"$headers"; then
   printf 'FAIL  %-45s %s\n' 'block page without WAF headers' "$(grep -iE '^(server|access-control)' <<<"$headers" | tr -d '\r' | paste -sd' ')"

@@ -166,7 +166,7 @@ that use it: check the Traefik log after every change.
 ```yaml
 command:
   - "--experimental.plugins.traefik-modsecurity-plugin.modulename=github.com/AmedickSommer/traefik-modsecurity-plugin"
-  - "--experimental.plugins.traefik-modsecurity-plugin.version=v1.2.0"
+  - "--experimental.plugins.traefik-modsecurity-plugin.version=v1.3.0"
 ```
 
 ```yaml

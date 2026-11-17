@@ -19,3 +19,11 @@ http:
             - name: skip-test
               action: skip-waf
               path: '^/skip/'
+            - name: rate-test
+              action: rate-limit
+              method: [POST]
+              path: '^/rate/'
+              limit: 2
+              limitPeriodSecs: 60
+              limitBy: ip-fingerprint
+              jailSecs: 60

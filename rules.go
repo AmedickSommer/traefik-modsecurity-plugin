@@ -10,9 +10,10 @@ import (
 
 // Rule actions.
 const (
-	ActionBlock    = "block"
-	ActionSkipBody = "skip-body"
-	ActionSkipWaf  = "skip-waf"
+	ActionBlock     = "block"
+	ActionSkipBody  = "skip-body"
+	ActionSkipWaf   = "skip-waf"
+	ActionRateLimit = "rate-limit"
 )
 
 // Rule matches requests and decides how the plugin treats them.
@@ -29,6 +30,11 @@ type Rule struct {
 	Header      string   `json:"header,omitempty"`
 	HeaderValue string   `json:"headerValue,omitempty"`
 	ClientIP    []string `json:"clientIp,omitempty"`
+
+	Limit           int    `json:"limit,omitempty"`
+	LimitPeriodSecs int    `json:"limitPeriodSecs,omitempty"`
+	LimitBy         string `json:"limitBy,omitempty"`
+	JailSecs        int    `json:"jailSecs,omitempty"`
 }
 
 type ruleSet struct {
@@ -77,6 +83,7 @@ type compiledRule struct {
 	header      string
 	headerValue *regexp.Regexp
 	clientNets  []*net.IPNet
+	limiter     *rateLimiter
 }
 
 var repeatedSlashes = regexp.MustCompile(`//+`)
@@ -170,6 +177,15 @@ func compileRule(rule Rule) (compiledRule, error) {
 	}
 	switch rule.Action {
 	case ActionBlock, ActionSkipBody, ActionSkipWaf:
+		if rule.Limit != 0 || rule.LimitPeriodSecs != 0 || rule.LimitBy != "" || rule.JailSecs != 0 {
+			return c, fmt.Errorf("limit, limitPeriodSecs, limitBy and jailSecs need action %q", ActionRateLimit)
+		}
+	case ActionRateLimit:
+		limiter, err := newRateLimiter(rule)
+		if err != nil {
+			return c, err
+		}
+		c.limiter = limiter
 	default:
 		return c, fmt.Errorf("unknown action %q", rule.Action)
 	}
